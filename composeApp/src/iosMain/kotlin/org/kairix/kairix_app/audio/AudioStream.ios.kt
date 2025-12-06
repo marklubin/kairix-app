@@ -14,12 +14,7 @@ actual class AudioStream actual constructor(
     private val playerNode = AVAudioPlayerNode()
     private var isCapturing = false
     private var isPlaying = false
-
-    // Format for capture (what we send to server)
-    private val captureFormat = AVAudioFormat(
-        standardFormatWithSampleRate = sampleRateIn.toDouble(),
-        channels = 1u
-    )
+    private var hwSampleRate: Int = 48000  // Will be set from actual hardware
 
     // Format for playback (what server sends us)
     private val playbackFormat = AVAudioFormat(
@@ -30,8 +25,7 @@ actual class AudioStream actual constructor(
     actual fun startCapture(onAudioChunk: (ByteArray) -> Unit) {
         if (isCapturing) return
 
-        // 1. Configure audio session (policy layer)
-        // This MUST happen before starting the engine
+        // 1. Configure audio session
         val session = AVAudioSession.sharedInstance()
         session.setCategory(
             AVAudioSessionCategoryPlayAndRecord,
@@ -42,28 +36,29 @@ actual class AudioStream actual constructor(
         )
         session.setActive(true, error = null)
 
-        // 2. Get input node
+        // 2. Get input node and its NATIVE hardware format
         val inputNode = audioEngine.inputNode
+        val hwFormat = inputNode.outputFormatForBus(0u)
+        hwSampleRate = hwFormat.sampleRate.toInt()
 
-        // 3. Install tap with our desired format - iOS will resample for us
-        // Request 16kHz mono, iOS converts from hardware rate (usually 48kHz)
+        // 3. Tap at HARDWARE format, resample manually in callback
+        // This is the most reliable approach - iOS requires tap format to match hardware
         inputNode.installTapOnBus(
             bus = 0u,
-            bufferSize = 1024u,  // ~64ms at 16kHz
-            format = captureFormat
+            bufferSize = 4096u,
+            format = hwFormat
         ) { buffer, _ ->
             buffer?.let {
-                val bytes = pcmBufferToBytes(it)
+                // Resample from hardware rate (48kHz) to target rate (16kHz)
+                val bytes = pcmBufferToBytesResampled(it, hwSampleRate, sampleRateIn)
                 if (bytes.isNotEmpty()) {
                     onAudioChunk(bytes)
                 }
             }
         }
 
-        // 4. Set up player node for playback at server's sample rate
+        // 4. Set up player node for playback
         audioEngine.attachNode(playerNode)
-        // Connect player → mixer using playback format (22050Hz)
-        // iOS will resample to hardware output rate
         audioEngine.connect(playerNode, audioEngine.mainMixerNode, playbackFormat)
 
         // 5. Start the engine
@@ -79,9 +74,7 @@ actual class AudioStream actual constructor(
         audioEngine.stop()
         isCapturing = false
 
-        // Deactivate audio session
-        val session = AVAudioSession.sharedInstance()
-        session.setActive(false, error = null)
+        AVAudioSession.sharedInstance().setActive(false, error = null)
     }
 
     actual fun playAudio(data: ByteArray) {
@@ -105,32 +98,49 @@ actual class AudioStream actual constructor(
     }
 
     /**
-     * Convert AVAudioPCMBuffer (float32) to ByteArray (int16 PCM).
-     * iOS gives us float samples in range -1.0 to 1.0
-     * Server expects Int16 samples in range -32768 to 32767
+     * Convert AVAudioPCMBuffer (float32) to ByteArray (int16 PCM) with resampling.
+     * Resamples from hardware rate (e.g., 48kHz) to target rate (e.g., 16kHz).
+     * Uses linear interpolation for reasonable quality.
      */
-    private fun pcmBufferToBytes(buffer: AVAudioPCMBuffer): ByteArray {
+    private fun pcmBufferToBytesResampled(
+        buffer: AVAudioPCMBuffer,
+        fromRate: Int,
+        toRate: Int
+    ): ByteArray {
         val floatData = buffer.floatChannelData ?: return ByteArray(0)
-        val frameCount = buffer.frameLength.toInt()
+        val inputFrameCount = buffer.frameLength.toInt()
 
-        if (frameCount == 0) return ByteArray(0)
+        if (inputFrameCount == 0) return ByteArray(0)
 
-        // Get pointer to first channel (mono)
         val channelData = floatData[0] ?: return ByteArray(0)
 
-        // Convert float32 to int16 little-endian
-        val bytes = ByteArray(frameCount * 2)
-        for (i in 0 until frameCount) {
-            val floatSample = channelData[i]
-            // Clamp and convert to Int16
-            val intSample = (floatSample * 32767f)
+        // Calculate resampling ratio and output size
+        val ratio = fromRate.toDouble() / toRate  // e.g., 48000/16000 = 3.0
+        val outputFrameCount = (inputFrameCount / ratio).toInt()
+
+        val bytes = ByteArray(outputFrameCount * 2)
+
+        for (i in 0 until outputFrameCount) {
+            // Linear interpolation for better quality than simple decimation
+            val srcPos = i * ratio
+            val srcIdx = srcPos.toInt()
+            val frac = (srcPos - srcIdx).toFloat()
+
+            val sample1 = channelData[srcIdx]
+            val sample2 = if (srcIdx + 1 < inputFrameCount) channelData[srcIdx + 1] else sample1
+            val interpolated = sample1 + (sample2 - sample1) * frac
+
+            // Convert to int16
+            val intSample = (interpolated * 32767f)
                 .toInt()
                 .coerceIn(-32768, 32767)
                 .toShort()
-            // Little-endian: low byte first
+
+            // Little-endian
             bytes[i * 2] = (intSample.toInt() and 0xFF).toByte()
             bytes[i * 2 + 1] = (intSample.toInt() shr 8 and 0xFF).toByte()
         }
+
         return bytes
     }
 
@@ -144,8 +154,7 @@ actual class AudioStream actual constructor(
 
         val frameCount = data.size / 2  // 2 bytes per sample
 
-        val buffer = AVAudioPCMBuffer(playbackFormat!!, frameCapacity = frameCount.toUInt())
-            ?: return null
+        val buffer = AVAudioPCMBuffer(playbackFormat, frameCapacity = frameCount.toUInt())
 
         buffer.frameLength = frameCount.toUInt()
 
