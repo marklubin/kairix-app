@@ -1,7 +1,5 @@
-TEAM_ID=
+// SQLDelight requires linking against system SQLite
+OTHER_LDFLAGS = $(inherited) -lsqlite3
 
-PRODUCT_NAME=kairix_app
-PRODUCT_BUNDLE_IDENTIFIER=org.kairix.kairix_app.kairix_app$(TEAM_ID)
-
-CURRENT_PROJECT_VERSION=1
-MARKETING_VERSION=1.0
+// Preserve default product name from project
+PRODUCT_NAME = $(TARGET_NAME)
